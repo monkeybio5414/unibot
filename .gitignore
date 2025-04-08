@@ -45,6 +45,8 @@ logs/
 *.pth
 src/data/cache/
 models/
+!src/models/*.py
+!src/models/__init__.py
 
 # Data files
 *.csv
