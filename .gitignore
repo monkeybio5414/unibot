@@ -25,6 +25,7 @@ venv/
 ENV/
 env/
 .env
+ven311/
 
 # IDE
 .idea/
@@ -42,14 +43,24 @@ models/
 *.pth
 *.bin
 *.onnx
+*.safetensors
 
 # Data
 data/
 *.csv
 *.json
-*.txt
-!requirements.txt
+dataset/
+dataset.zip
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Conda
+Miniconda*
+
+# Keep these files
+!src/
+!static/
+!requirements.txt
+!README.md 
