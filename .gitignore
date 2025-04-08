@@ -37,20 +37,19 @@ ven311/
 logs/
 *.log
 
-# Model files
-models/
-*.pt
-*.pth
+# Large model files and cache
+*.safetensors
 *.bin
 *.onnx
-*.safetensors
+*.pt
+*.pth
+src/data/cache/
+models/
 
-# Data
-data/
+# Data files
 *.csv
-*.json
-dataset/
-dataset.zip
+*.txt
+!requirements.txt
 
 # OS
 .DS_Store
@@ -62,5 +61,4 @@ Miniconda*
 # Keep these files
 !src/
 !static/
-!requirements.txt
 !README.md 
