@@ -16,3 +16,16 @@ python-multipart>=0.0.6
 nltk>=3.8.1
 textblob>=0.17.1
 langdetect>=1.0.9 
+
+
+# unibotenv/bin/activate && pip install -r requirements.txt
+#cd src/api && uvicorn main:app --host 0.0.0.0 --port 8001
+
+from transformers import AutoTokenizer, AutoModel
+from sentence_transformers import SentenceTransformer
+
+# Load the model using safetensors
+model = AutoModel.from_pretrained(
+    'models/sentence-transformers/sentence-transformers_all-MiniLM-L6-v2',
+    use_safetensors=True
+)

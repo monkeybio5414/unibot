@@ -50,12 +50,218 @@ class NLG:
             raise
         
         self.similarity_threshold = 0.4  # Lower threshold to include more relevant docs
-        self.max_context_docs = 5  # Maximum number of context documents to include
+        self.max_context_docs = 3  # Reduced from 5 to 3 to speed up generation
         self.response_cache = {}
         self.cache_ttl = 3600  # Cache responses for 1 hour
         self.min_similarity_threshold = 0.4
-        self.max_context_length = 5  # Maximum number of relevant documents to include
+        self.max_context_length = 3  # Reduced from 5 to 3 to speed up generation
         
+        # Initialize cache
+        self._init_cache()
+        
+    def _init_cache(self):
+        """Initialize response cache"""
+        self.cache = {}
+        self.cache_timestamps = {}
+        
+    def _get_cache_key(self, query: str, context: str) -> str:
+        """Generate a cache key from query and context"""
+        return hashlib.md5((query + context).encode()).hexdigest()
+        
+    def _check_cache(self, query: str, context: str) -> Optional[str]:
+        """Check if response exists in cache and is not expired"""
+        cache_key = self._get_cache_key(query, context)
+        if cache_key in self.cache:
+            timestamp = self.cache_timestamps.get(cache_key, 0)
+            if time.time() - timestamp < self.cache_ttl:
+                return self.cache[cache_key]
+        return None
+        
+    def _update_cache(self, query: str, context: str, response: str):
+        """Update cache with new response"""
+        cache_key = self._get_cache_key(query, context)
+        self.cache[cache_key] = response
+        self.cache_timestamps[cache_key] = time.time()
+        
+    def _prepare_context(self, query: str, search_results: List[Union[Tuple[str, float], Dict]]) -> str:
+        """Prepare context for the model"""
+        # Log the input query and search results
+        logger.info(f"Preparing context for query: {query}")
+        logger.info(f"Number of search results: {len(search_results)}")
+        
+        # Start with the query
+        context = f"Question: {query}\n\nRelevant Information:\n"
+        
+        # Add search results (limited to max_context_docs)
+        for i, result in enumerate(search_results[:self.max_context_docs], 1):
+            # Handle both tuple and dictionary formats
+            if isinstance(result, tuple):
+                text, similarity = result
+            else:
+                text = result.get('text', '')
+                similarity = result.get('similarity', 'N/A')
+            
+            # Truncate long texts to reduce context length
+            if len(text) > 100:  # Reduced from 200 to 100
+                text = text[:100] + "..."
+                
+            logger.debug(f"Processing search result {i}")
+            logger.debug(f"Text: {text}")
+            logger.debug(f"Similarity: {similarity}")
+            context += f"{i}. {text}\n"
+        
+        logger.debug(f"Final context: {context}")
+        return context
+
+    def _generate_with_model(self, context: str) -> str:
+        """Generate response using the TinyLlama model"""
+        try:
+            logger.info("Starting model generation...")
+            
+            # Simple prompt for direct response generation
+            prompt = f"""<|system|>
+You are a helpful assistant for the University of Nottingham Malaysia. Answer the question using only the information provided.
+</s>
+<|user|>
+{context}
+</s>
+<|assistant|>"""
+            
+            # Tokenize
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Generate response
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=512,
+                    min_length=32,
+                    num_beams=2,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    repetition_penalty=1.2,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
+                )
+            
+            # Decode and clean response
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            response = response.split("<|assistant|>")[-1].strip()
+            
+            # Basic cleaning
+            response = response.replace("Answer:", "").strip()
+            if not response.endswith('.'):
+                response += '.'
+            
+            logger.info("Model generation completed successfully")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error in model generation: {str(e)}", exc_info=True)
+            raise
+
+    def _validate_response(self, response: str, context: str) -> bool:
+        """Validate that the response only contains information from the context"""
+        # Check for common hallucination patterns
+        if "I don't have that specific information" in response:
+            return True  # This is an acceptable response
+            
+        # Extract key facts from response
+        response_facts = set(response.lower().split())
+        
+        # Extract key facts from context
+        context_facts = set(context.lower().split())
+        
+        # Check if response contains facts not in context
+        new_facts = response_facts - context_facts
+        
+        # Allow some common words and punctuation
+        allowed_words = {'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 
+                        'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'as', 'from',
+                        '.', ',', ':', ';', '!', '?'}
+        
+        # Remove allowed words from new facts
+        new_facts = new_facts - allowed_words
+        
+        # If there are significant new facts not in context, response is invalid
+        if len(new_facts) > 3:  # Allow for minor variations
+            logger.warning(f"Response contains facts not in context: {new_facts}")
+            return False
+            
+        return True
+
+    def _clean_response(self, response: str) -> str:
+        """Clean and format the response to be more natural"""
+        # Remove common prefixes
+        prefixes_to_remove = [
+            r'^Answer:\s*',
+            r'^Response:\s*',
+            r'^The answer is:\s*',
+            r'^Here is the answer:\s*'
+        ]
+        
+        for prefix in prefixes_to_remove:
+            response = re.sub(prefix, '', response, flags=re.IGNORECASE)
+            
+        # Remove common suffixes and signatures
+        suffixes_to_remove = [
+            r'\s*Best regards,.*$',
+            r'\s*Regards,.*$',
+            r'\s*Sincerely,.*$',
+            r'\s*Thank you,.*$',
+            r'\s*\[Your Name\].*$',
+            r'\s*\[Name\].*$',
+            r'\s*\[Assistant\].*$',
+            r'\s*\[AI Assistant\].*$',
+            r'\s*Let me know if you have any other questions or concerns.*$',
+            r'\s*I hope this helps!.*$',
+            r'\s*Please let me know if you need anything else.*$',
+            r'\s*We invite you to visit us soon!.*$',
+            r'\s*Thank you.*$',
+            r'\s*You\'re welcome.*$'
+        ]
+        
+        for suffix in suffixes_to_remove:
+            response = re.sub(suffix, '', response, flags=re.IGNORECASE)
+            
+        # Remove any trailing whitespace and ensure proper ending
+        response = response.strip()
+        if not response.endswith('.'):
+            response += '.'
+            
+        return response
+
+    def generate_response(self, query: str, search_results: List[Tuple[str, float]]) -> str:
+        """Generate a response using the language model"""
+        try:
+            # Prepare context from search results
+            context = self._prepare_context(query, search_results)
+            
+            # Check cache first
+            cached_response = self._check_cache(query, context)
+            if cached_response:
+                logger.info("Using cached response")
+                return cached_response
+            
+            # Generate response
+            response = self._generate_with_model(context)
+            
+            # Cache the response
+            self._update_cache(query, context, response)
+            
+            # Return raw response without post-processing
+            if not response or response.isspace():
+                logger.warning("Empty response from model")
+                raise ValueError("Empty response generated")
+                
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}", exc_info=True)
+            raise
+
     def generate_fallback_response(self, query: str) -> Dict[str, Any]:
         """Generate a fallback response when no good match is found"""
         is_location_question = query.lower().startswith('where')
@@ -123,362 +329,6 @@ class NLG:
                 
         return reasoning
     
-    def generate_response(self, query: str, search_results: List[Tuple[str, float]]) -> str:
-        """Generate a response using the language model"""
-        try:
-            # Prepare context from search results
-            context = self._prepare_context(query, search_results)
-            
-            # Generate response
-            response = self._generate_with_model(context)
-            
-            # Return raw response without post-processing
-            if not response or response.isspace():
-                logger.warning("Empty response from model")
-                raise ValueError("Empty response generated")
-                
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error generating response: {str(e)}", exc_info=True)
-            raise
-
-    def _prepare_context(self, query: str, search_results: List[Union[Tuple[str, float], Dict]]) -> str:
-        """Prepare context for the model"""
-        # Log the input query and search results
-        logger.info(f"Preparing context for query: {query}")
-        logger.info(f"Number of search results: {len(search_results)}")
-        
-        # Start with the query
-        context = f"Question: {query}\n\nRelevant Information:\n"
-        
-        # Add search results
-        for i, result in enumerate(search_results, 1):
-            # Handle both tuple and dictionary formats
-            if isinstance(result, tuple):
-                text, similarity = result
-            else:
-                text = result.get('text', '')
-                similarity = result.get('similarity', 'N/A')
-            
-            logger.debug(f"Processing search result {i}")
-            logger.debug(f"Text: {text[:200]}...")
-            logger.debug(f"Similarity: {similarity}")
-            context += f"{i}. {text}\n"
-        
-        # Add instructions
-        context += "\nInstructions: Based on the following information, provide a clear and concise response. Focus on the most relevant details and maintain a natural, conversational tone."
-        
-        logger.debug(f"Final context: {context}")
-        return context
-
-    def _generate_with_model(self, context: str) -> str:
-        """Generate response using the TinyLlama model"""
-        try:
-            logger.info("Starting model generation...")
-            
-            # Prepare the prompt
-            prompt = f"""<|system|>
-You are a helpful assistant for the University of Nottingham Malaysia. Keep responses concise and complete.
-</s>
-<|user|>
-{context}
-</s>
-<|assistant|>"""
-            
-            # Tokenize with moderate max length
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # Generate with balanced parameters
-            with torch.inference_mode():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=768,
-                    min_length=64,
-                    num_beams=2,
-                    do_sample=True,
-                    temperature=0.7,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    early_stopping=True
-                )
-            
-            # Decode and extract response
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            response_parts = response.split("<|assistant|>")
-            
-            if len(response_parts) > 1:
-                response = response_parts[-1].strip()
-            else:
-                response = response.strip()
-                
-            logger.info(f"Raw model response: {response}")
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error in model generation: {str(e)}", exc_info=True)
-            raise
-
-    def _post_process_response(self, response: str, query: str) -> str:
-        """Post-process the generated response"""
-        logger.info("Starting post-processing of response")
-        logger.debug(f"Original response: {response}")
-        
-        # Clean up the response
-        response = re.sub(r'\s+', ' ', response).strip()
-        logger.debug(f"Cleaned response: {response}")
-        
-        # Handle location queries
-        if any(word in query.lower() for word in ['where', 'location', 'address', 'campus']):
-            logger.info("Processing location query")
-            
-            # Try different patterns to extract location information
-            patterns = [
-                r'(?:located|situated|found).*?(?:in|at)\s+(.*?)(?:\.|\n|$)',
-                r'(?:address|location).*?(?:is|:)\s+(.*?)(?:\.|\n|$)',
-                r'(?:campus|university).*?(?:in|at)\s+(.*?)(?:\.|\n|$)'
-            ]
-            
-            location = None
-            for pattern in patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    location = match.group(1).strip()
-                    break
-            
-            # Try to extract distance information
-            distance = re.search(r'(?:about|approximately|around)\s+(\d+)\s*(?:km|kilometers?)\s+(?:from|to)\s+(.*?)(?:\.|\n|$)', response, re.IGNORECASE)
-            
-            logger.debug(f"Extracted location: {location}")
-            logger.debug(f"Extracted distance: {distance.groups() if distance else None}")
-            
-            # Build the response
-            response_parts = []
-            
-            if location:
-                response_parts.append(f"The University of Nottingham Malaysia campus is located in {location}.")
-            else:
-                # Fallback location if not found in response
-                response_parts.append("The University of Nottingham Malaysia campus is located in Semenyih, Selangor.")
-            
-            if distance:
-                response_parts.append(f"It is approximately {distance.group(1)} kilometers from {distance.group(2)}.")
-            else:
-                # Add default distance information
-                response_parts.append("It is approximately 45 kilometers from Kuala Lumpur city center.")
-            
-            final_response = " ".join(response_parts)
-            logger.debug(f"Final processed response: {final_response}")
-            return final_response
-        
-        # Handle library queries
-        if any(word in query.lower() for word in ['library', 'librarian', 'reference desk']):
-            logger.info("Processing library query")
-            # Extract contact information with improved regex
-            phone = re.search(r'(?:03-)?\d{4}\s*\d{4}', response)
-            hours = re.search(r'between (.*?) on weekdays', response.lower())
-            
-            logger.debug(f"Extracted phone: {phone.group(0) if phone else 'None'}")
-            logger.debug(f"Extracted hours: {hours.group(1) if hours else 'None'}")
-            
-            # Build a structured response
-            response_parts = ["The University of Nottingham Malaysia Library provides comprehensive services to students and staff."]
-            
-            if phone:
-                response_parts.append(f"You can contact the Reference Desk at {phone.group(0)}")
-            
-            if hours:
-                response_parts.append(f"Library staff are available at the Reference Desk {hours.group(1)} on weekdays.")
-            
-            # Add social media information if available
-            if 'twitter' in response.lower():
-                response_parts.append("You can follow the Library on Twitter for the latest updates.")
-            
-            # Add membership benefits if available
-            if 'membership' in response.lower():
-                response_parts.append("Library membership includes borrowing privileges, access to facilities, and interlibrary loan services.")
-            
-            final_response = "\n".join(response_parts)
-            logger.debug(f"Final processed response: {final_response}")
-            return final_response
-        
-        # Handle specialization queries
-        if any(word in query.lower() for word in ['specialization', 'specialize', 'specialized', 'specializing']):
-            logger.info("Processing specialization query")
-            # Extract specializations from the response
-            specializations = []
-            if 'specializations in areas such as' in response.lower():
-                spec_match = re.search(r'specializations in areas such as (.*?)(?:\.|$)', response.lower())
-                if spec_match:
-                    specializations = [s.strip() for s in spec_match.group(1).split(',')]
-            
-            # Extract program types
-            programs = []
-            if 'bsc' in response.lower():
-                programs.append('BSc (Hons) Computer Science')
-            if 'msc' in response.lower():
-                msc_programs = re.findall(r'MSc in ([^,\.]+)', response)
-                programs.extend([f'MSc in {p.strip()}' for p in msc_programs])
-            if 'mphil' in response.lower() or 'phd' in response.lower():
-                phd_programs = re.findall(r'PhD in ([^,\.]+)', response)
-                programs.extend([f'PhD in {p.strip()}' for p in phd_programs])
-            
-            # Build a structured response
-            response_parts = ["The School of Computer Science offers various programs and specializations:"]
-            
-            if specializations:
-                response_parts.append(f"Specializations include: {', '.join(specializations)}.")
-            
-            if programs:
-                response_parts.append("\nAvailable programs:")
-                for program in sorted(set(programs)):  # Remove duplicates and sort
-                    response_parts.append(f"- {program}")
-            
-            final_response = "\n".join(response_parts)
-            logger.info(f"Final processed response: {final_response}")
-            return final_response
-        
-        # Handle accommodation queries
-        if any(word in query.lower() for word in ['accommodation', 'housing', 'residence', 'dorm', 'dormitory']):
-            # Extract accommodation types
-            has_on_campus = 'on-campus' in response.lower()
-            has_off_campus = 'off-campus' in response.lower()
-            has_postgrad = 'postgraduate' in response.lower()
-            
-            # Extract contact information
-            contact = re.search(r'contact (?:the )?([^\.]+) for', response.lower())
-            
-            # Build a structured response
-            response_parts = ["Yes, the University of Nottingham Malaysia provides accommodation options for students."]
-            
-            # Add accommodation types
-            if has_on_campus and has_off_campus:
-                response_parts.append("Both on-campus and off-campus accommodation are available.")
-            elif has_on_campus:
-                response_parts.append("On-campus accommodation is available.")
-            elif has_off_campus:
-                response_parts.append("Off-campus accommodation options are available near the university.")
-            
-            # Add specific details
-            if has_postgrad:
-                response_parts.append("There are specific accommodation options designed for postgraduate students.")
-            
-            # Add contact information
-            if contact:
-                response_parts.append(f"For more information and booking assistance, you can contact {contact.group(1)}.")
-            
-            final_response = "\n".join(response_parts)
-            logger.info(f"Final processed response: {final_response}")
-            return final_response
-        
-        # Handle international student support queries
-        if any(word in query.lower() for word in ['international', 'support', 'student support']):
-            # Extract contact information
-            email = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', response)
-            phone = re.search(r'(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{4}[-.\s]?\d{4}', response)
-            
-            # Extract support services
-            services = []
-            if 'documentation' in response.lower():
-                services.append('documentation (visa letters, bank account letters)')
-            if 'visa' in response.lower():
-                services.append('visa assistance')
-            if 'bank' in response.lower():
-                services.append('bank account assistance')
-            if 'living' in response.lower():
-                services.append('living expenses advice')
-            
-            # Build a structured response
-            response_parts = ["The University of Nottingham Malaysia provides comprehensive support for international students."]
-            
-            if services:
-                response_parts.append(f"Services include: {', '.join(services)}.")
-            
-            if email or phone:
-                response_parts.append("You can contact the International Student Support Office through:")
-                if email:
-                    response_parts.append(f"- Email: {email.group(0)}")
-                if phone:
-                    response_parts.append(f"- Phone: {phone.group(0)}")
-            
-            final_response = "\n".join(response_parts)
-            logger.info(f"Final processed response: {final_response}")
-            return final_response
-        
-        # Handle language requirement queries
-        if any(word in query.lower() for word in ['language', 'english', 'ielts', 'toefl', 'pte']):
-            # Extract all unique language tests from the response
-            tests = re.findall(r'(?:IELTS|TOEFL|PTE|GCE A Level|SPM|GCSE O-Level|IGCSE|MUET|IB English|OSSD English|CBSE/CISCE Class XII|CBSE/CISCE Class X)', response)
-            unique_tests = sorted(set(tests))  # Remove duplicates and sort
-            
-            if unique_tests:
-                # Group similar tests together
-                grouped_tests = []
-                for test in unique_tests:
-                    if test not in grouped_tests:
-                        grouped_tests.append(test)
-                
-                # Format the response
-                if len(grouped_tests) > 5:
-                    # If many tests, group them by type
-                    international_tests = [t for t in grouped_tests if t in ['IELTS', 'TOEFL', 'PTE']]
-                    school_tests = [t for t in grouped_tests if t in ['GCE A Level', 'SPM', 'GCSE O-Level', 'IGCSE']]
-                    other_tests = [t for t in grouped_tests if t not in international_tests + school_tests]
-                    
-                    response_parts = ["The University of Nottingham Malaysia accepts the following English language tests:"]
-                    if international_tests:
-                        response_parts.append(f"International tests: {', '.join(international_tests)}")
-                    if school_tests:
-                        response_parts.append(f"School qualifications: {', '.join(school_tests)}")
-                    if other_tests:
-                        response_parts.append(f"Other qualifications: {', '.join(other_tests)}")
-                    
-                    final_response = "\n".join(response_parts)
-                    logger.info(f"Final processed response: {final_response}")
-                    return final_response
-                else:
-                    final_response = f"The University of Nottingham Malaysia accepts the following English language tests: {', '.join(grouped_tests)}."
-                    logger.info(f"Final processed response: {final_response}")
-                    return final_response
-        
-        # Handle program-related queries
-        if any(word in query.lower() for word in ['program', 'programs', 'course', 'courses', 'study', 'studies']):
-            # Extract program names if they're in a list format
-            program_match = re.search(r'programs listed include (.*?)(?:\.|$)', response.lower())
-            if program_match:
-                programs = program_match.group(1).strip()
-                response = f"The University of Nottingham Malaysia offers the following programs: {programs}."
-            else:
-                # If no list found, try to extract program names from the response
-                programs = re.findall(r'(?:Applied Psychology|Bioscience|Biomedical|Pharmacy|Business|Computer Sciences|Engineering|Economics|Education|Politics)', response)
-                if programs:
-                    response = f"The University of Nottingham Malaysia offers the following programs: {', '.join(programs)}."
-        
-        # Add location-specific formatting if needed
-        elif query.lower().startswith('where'):
-            # Ensure location information is properly formatted
-            if 'located' not in response.lower():
-                response = f"The University of Nottingham Malaysia campus is located in {response}"
-        
-        # Add facility-specific formatting if needed
-        elif any(word in query.lower() for word in ['facility', 'facilities', 'amenities']):
-            # Ensure facility information is properly formatted
-            if 'facilities' not in response.lower():
-                response = f"The University of Nottingham Malaysia campus offers the following facilities: {response}"
-        
-        logger.info("No special handling needed, returning cleaned response")
-        return response
-
-    def _similar_content(self, text1: str, text2: str, threshold: float = 0.8) -> bool:
-        """Check if two pieces of text are similar using character-level comparison"""
-        if not text1 or not text2:
-            return False
-        
-        # Use difflib's SequenceMatcher for similarity comparison
-        similarity = difflib.SequenceMatcher(None, text1, text2).ratio()
-        return similarity > threshold
-    
     def generate_multiple_responses(self, 
                                   query: str,
                                   num_responses: int = 3,
@@ -529,11 +379,6 @@ You are a helpful assistant for the University of Nottingham Malaysia. Keep resp
         if score < 0:
             return 0.0
         return min(1.0, score)
-
-    def _get_cache_key(self, query: str, context: str) -> str:
-        """Generate a unique cache key for the query and context."""
-        combined = f"{query}|{context}"
-        return hashlib.md5(combined.encode()).hexdigest()
 
     def _clean_response(self, response: str) -> str:
         """Clean and format the response."""

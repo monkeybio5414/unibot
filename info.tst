@@ -1,0 +1,1 @@
+Users/abc/miniconda3/envs/gensim_env/bin/python -m uvicorn src.api.main:app --reload --port 8001 --log-level debug

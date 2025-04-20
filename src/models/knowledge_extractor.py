@@ -1,24 +1,43 @@
+import os
+import logging
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from gensim.models import Word2Vec
 import json
 from typing import List, Dict, Any
-import logging
+from transformers import AutoTokenizer, AutoModel
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 class KnowledgeExtractor:
     def __init__(self):
         logger.info("Initializing KnowledgeExtractor...")
-        # Use the same model as SemanticSearch from local files
-        self.sentence_transformer = SentenceTransformer(
-            'all-MiniLM-L6-v2',
-            cache_folder='./models/sentence-transformers'  # Use local cache directory
-        )
+        
+        # Set environment variables to prevent downloads
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        
+        try:
+            # Initialize SentenceTransformer directly with the model path
+            self.sentence_transformer = SentenceTransformer(
+                'all-MiniLM-L6-v2',
+                cache_folder='./models/sentence-transformers'
+            )
+            
+            logger.info("KnowledgeExtractor initialized successfully with local model")
+            
+        except Exception as e:
+            logger.error(f"Error initializing KnowledgeExtractor: {str(e)}")
+            raise
+        
         self.tfidf = TfidfVectorizer(max_features=1000)
         self.word2vec = None
-        logger.info("KnowledgeExtractor initialized")
         
     def process_documents(self, documents: List[str], batch_size: int = 32) -> Dict[str, Any]:
         """Process documents using multiple embedding methods"""
